@@ -1,0 +1,361 @@
+
+import sysimport random
+import pygame
+import json
+import os
+
+# Retro Flappy Hawk
+# Drawn shapes only (no external assets). Spacebar to jump.
+
+BASE_W, BASE_H = 288, 512
+SCALE = 2
+W, H = BASE_W * SCALE, BASE_H * SCALE
+
+FPS = 60
+
+GRAVITY = 0.5
+JUMP_VEL = -8
+PIPE_SPEED = 2.5
+PIPE_GAP = 200
+PIPE_FREQ = 1500  # ms
+BUILDING_SPEED = PIPE_SPEED * 0.35
+# small anti-gravity factor: reduces downward acceleration slightly
+ANTI_GRAVITY = 0.15
+TERMINAL_VEL = 12
+
+# leaderboard
+LEADERBOARD_FILE = 'leaderboard.json'
+MAX_LEADERBOARD = 5
+
+pygame.init()
+screen = pygame.display.set_mode((W, H))
+clock = pygame.time.Clock()
+font = pygame.font.SysFont('Arial', 18 * SCALE)
+
+
+class Bird:
+    def __init__(self):
+        self.x = 72
+        self.y = BASE_H // 2
+        self.vel = 0
+        self.size = 12
+
+    def jump(self):
+        self.vel = JUMP_VEL
+
+    def update(self):
+        # apply gravity; when falling reduce gravity a bit to simulate 'anti-grav'
+        if self.vel > 0:
+            self.vel += GRAVITY * (1.0 - ANTI_GRAVITY)
+        else:
+            self.vel += GRAVITY
+
+        # cap downward speed
+        if self.vel > TERMINAL_VEL:
+            self.vel = TERMINAL_VEL
+
+        self.y += self.vel
+
+        if self.y < 0:
+            self.y = 0
+            self.vel = 0
+
+    def get_rect(self):
+        s = self.size
+        return pygame.Rect(int(self.x - s), int(self.y - s), s * 2, s * 2)
+
+    def draw(self, surf):
+        # draw a simple hawk: green body, blue beak
+        r = self.get_rect()
+        # body (square blocky to be retro)
+        body_color = (34, 177, 76)  # green feathers
+        pygame.draw.rect(surf, body_color, r)
+
+        # eye
+        eye = (r.x + r.w - 6, r.y + 4)
+        pygame.draw.rect(surf, (0, 0, 0), (eye[0], eye[1], 3, 3))
+
+        # beak (blue)
+        beak_color = (0, 121, 184)
+        beak = [(r.x + r.w, r.y + r.h // 2 - 2), (r.x + r.w + 8, r.y + r.h // 2), (r.x + r.w, r.y + r.h // 2 + 2)]
+        pygame.draw.polygon(surf, beak_color, beak)
+
+
+class PipePair:
+    def __init__(self, x):
+        self.x = x
+        self.w = 52
+        self.gap = PIPE_GAP
+        self.top = random.randint(40, BASE_H - 40 - self.gap)
+
+    def update(self):
+        self.x -= PIPE_SPEED
+
+    def offscreen(self):
+        return self.x + self.w < -10
+
+    def collides(self, r: pygame.Rect):
+        top_rect = pygame.Rect(int(self.x), 0, self.w, int(self.top))
+        bottom_rect = pygame.Rect(int(self.x), int(self.top + self.gap), self.w, BASE_H - int(self.top + self.gap))
+        return r.colliderect(top_rect) or r.colliderect(bottom_rect)
+
+    def draw(self, surf):
+        # yellow pipes
+        pipe_color = (255, 204, 0)
+        dark = (200, 160, 0)
+        x = int(self.x)
+        w = int(self.w)
+        # top
+        pygame.draw.rect(surf, pipe_color, (x, 0, w, int(self.top)))
+        pygame.draw.rect(surf, dark, (x, int(max(0, self.top - 6)), w, 6))
+        # bottom
+        pygame.draw.rect(surf, pipe_color, (x, int(self.top + self.gap), w, BASE_H - int(self.top + self.gap)))
+        pygame.draw.rect(surf, dark, (x, int(self.top + self.gap), w, 6))
+
+
+def draw_background(surf):
+    # simple modern city covered in plants: sky + pre-generated buildings drawn with horizontal offset
+    sky = (92, 148, 252)
+    surf.fill(sky)
+    # buildings are drawn by the caller using a pre-generated list for stable visuals
+
+
+def generate_buildings(total_length):
+    bcolors = [(60, 60, 60), (80, 80, 100), (40, 50, 70)]
+    x = 0
+    buildings = []
+    while x < total_length:
+        bw = random.choice([24, 32, 40, 48])
+        h = random.randint(60, BASE_H - 140)
+        c = random.choice(bcolors)
+        # precompute simple window positions and vine seeds to keep drawing deterministic
+        windows = []
+        for wy in range(BASE_H - h + 8, BASE_H - 8, 12):
+            for wx in range(x + 6, x + bw - 6, 10):
+                if random.random() > 0.6:
+                    windows.append((wx - x, wy))
+        vines = []
+        for i in range(3):
+            vx = random.randint(0, max(0, bw - 4))
+            vine = []
+            for vy in range(BASE_H - h + random.randint(0, 20), BASE_H - 4, 8):
+                if random.random() > 0.2:
+                    vine.append((vx, vy))
+                vx += random.choice([-1, 0, 1])
+            vines.append(vine)
+
+        buildings.append({'x': x, 'bw': bw, 'h': h, 'color': c, 'windows': windows, 'vines': vines})
+        x += bw + random.randint(4, 10)
+    return buildings
+
+
+def draw_buildings(surf, buildings, offset, total_length):
+    vine_color = (34, 139, 34)
+    for b in buildings:
+        x = b['x'] - offset
+        # wrap drawing so that tiled buildings cover the screen
+        for shift in (-total_length, 0, total_length):
+            bx = int(x + shift)
+            bw = b['bw']
+            h = b['h']
+            c = b['color']
+            if bx + bw < 0 or bx > BASE_W:
+                continue
+            pygame.draw.rect(surf, c, (bx, BASE_H - h, bw, h))
+            for w in b['windows']:
+                wx = bx + w[0]
+                wy = w[1]
+                pygame.draw.rect(surf, (255, 220, 120), (wx, wy, 6, 6))
+            for vine in b['vines']:
+                vx = bx
+                for v in vine:
+                    pygame.draw.rect(surf, vine_color, (bx + v[0], v[1], 3, 4))
+
+
+def scale_surface(surf):
+    return pygame.transform.scale(surf, (W, H))
+
+
+def load_leaderboard():
+    if os.path.exists(LEADERBOARD_FILE):
+        try:
+            with open(LEADERBOARD_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+
+def save_leaderboard(board):
+    with open(LEADERBOARD_FILE, 'w') as f:
+        json.dump(board, f, indent=2)
+
+
+def is_high_score(score, board):
+    if len(board) < MAX_LEADERBOARD:
+        return True
+    return score > board[-1]['score']
+
+
+def add_to_leaderboard(name, score, board):
+    board.append({'name': name, 'score': score})
+    board.sort(key=lambda x: x['score'], reverse=True)
+    return board[:MAX_LEADERBOARD]
+
+
+def draw_leaderboard(surf, board, highlight_score=None):
+    title_font = pygame.font.SysFont('Arial', 24 * SCALE, bold=True)
+    entry_font = pygame.font.SysFont('Arial', 18 * SCALE)
+
+    title = title_font.render('LEADERBOARD', True, (255, 255, 255))
+    surf.blit(title, (BASE_W // 2 - title.get_width() // 2, 80))
+
+    y = 120
+    for i, entry in enumerate(board):
+        color = (255, 215, 0) if entry['score'] == highlight_score else (255, 255, 255)
+        rank = f"{i+1}. {entry['name'][:10]:<10} {entry['score']:>4}"
+        text = entry_font.render(rank, True, color)
+        surf.blit(text, (BASE_W // 2 - text.get_width() // 2, y))
+        y += 30
+
+
+def main():
+    surface = pygame.Surface((BASE_W, BASE_H))
+    # pre-render static background (sky, etc.) to a surface
+    bg = pygame.Surface((BASE_W, BASE_H))
+    draw_background(bg)
+    bird = Bird()
+    pipes = []
+    score = 0
+    running = True
+    game_over = False
+    # background buildings setup
+    total_bg_length = BASE_W * 2
+    buildings = generate_buildings(total_bg_length)
+    bg_offset = 0.0
+
+    # leaderboard state
+    leaderboard = load_leaderboard()
+    entering_name = False
+    player_name = ''
+    name_submitted = False
+
+    pygame.time.set_timer(pygame.USEREVENT + 1, PIPE_FREQ)
+
+    while running:
+        dt = clock.tick(FPS)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if entering_name:
+                    # handle name input
+                    if event.key == pygame.K_RETURN:
+                        if player_name.strip():
+                            leaderboard = add_to_leaderboard(player_name.strip(), score, leaderboard)
+                            save_leaderboard(leaderboard)
+                            entering_name = False
+                            name_submitted = True
+                    elif event.key == pygame.K_BACKSPACE:
+                        player_name = player_name[:-1]
+                    elif event.unicode.isprintable() and len(player_name) < 15:
+                        player_name += event.unicode
+                elif event.key == pygame.K_SPACE:
+                    if game_over:
+                        # restart
+                        bird = Bird()
+                        pipes = []
+                        score = 0
+                        game_over = False
+                        entering_name = False
+                        player_name = ''
+                        name_submitted = False
+                        leaderboard = load_leaderboard()
+                    else:
+                        bird.jump()
+                elif not game_over:
+                    if event.key == pygame.K_SPACE:
+                        bird.jump()
+            elif event.type == pygame.USEREVENT + 1 and not game_over:
+                pipes.append(PipePair(BASE_W + 10))
+
+        if not game_over:
+            bird.update()
+            # update pipes
+            for p in pipes:
+                p.update()
+
+            # update background offset (slower than pipes for parallax)
+            bg_offset = (bg_offset + BUILDING_SPEED) % total_bg_length
+
+            # remove offscreen pipes
+            pipes = [p for p in pipes if not p.offscreen()]
+
+            # scoring: when pipe passes bird x and not counted
+            for p in pipes:
+                if not hasattr(p, 'passed') and p.x + p.w < bird.x:
+                    p.passed = True
+                    score += 1
+
+            # collisions
+            r = bird.get_rect()
+            if bird.y + bird.size * 2 >= BASE_H:
+                game_over = True
+                if is_high_score(score, leaderboard) and not name_submitted:
+                    entering_name = True
+            for p in pipes:
+                if p.collides(r):
+                    game_over = True
+                    if is_high_score(score, leaderboard) and not name_submitted:
+                        entering_name = True
+
+        # draw everything on base surface (use pre-rendered background)
+        surface.blit(bg, (0, 0))
+        draw_buildings(surface, buildings, bg_offset, total_bg_length)
+
+        # draw pipes
+        for p in pipes:
+            p.draw(surface)
+
+        # draw bird
+        bird.draw(surface)
+
+        # HUD
+        score_surf = font.render(str(score), True, (255, 255, 255))
+        surface.blit(score_surf, (BASE_W // 2 - score_surf.get_width() // 2, 8))
+
+        if game_over:
+            if entering_name:
+                # name entry UI
+                prompt = font.render('NEW HIGH SCORE!', True, (255, 215, 0))
+                surface.blit(prompt, (BASE_W // 2 - prompt.get_width() // 2, 40))
+
+                name_prompt = font.render('Enter your name:', True, (255, 255, 255))
+                surface.blit(name_prompt, (BASE_W // 2 - name_prompt.get_width() // 2, 180))
+
+                # name input box
+                name_display = player_name + '_'
+                name_text = font.render(name_display, True, (255, 255, 0))
+                surface.blit(name_text, (BASE_W // 2 - name_text.get_width() // 2, 220))
+
+                hint = font.render('Press ENTER to submit', True, (180, 180, 180))
+                surface.blit(hint, (BASE_W // 2 - hint.get_width() // 2, 280))
+            else:
+                # show leaderboard
+                draw_leaderboard(surface, leaderboard, score if name_submitted else None)
+
+                go = font.render('GAME OVER - Press SPACE to restart', True, (255, 50, 50))
+                surface.blit(go, (BASE_W // 2 - go.get_width() // 2, BASE_H - 60))
+
+        # scale and blit
+        screen.blit(scale_surface(surface), (0, 0))
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit()
+
+
+if __name__ == '__main__':
+    main()
+
+Sent with Proton Mail secure email.
